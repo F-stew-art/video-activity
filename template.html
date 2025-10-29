@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Synchronized MP4 Player (Polling)</title>
+    <style>
+        /* CSS Reset and Body Styles (Self-contained, CSP compliant for discord) */
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+            background-color: #0f172a;
+            /* Slate 900 */
+            color: #cbd5e1;
+            /* Slate 300 */
+            margin: 0;
+            padding: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 95vh;
+        }
+
+        .container {
+            max-width: 90vw;
+            max-height: 90vh;
+            padding: 1.5rem;
+            /* p-6 */
+            background-color: #1e293b;
+            /* Slate 800 */
+            border-radius: 0.75rem;
+            /* rounded-xl */
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+            /* shadow-2xl */
+            position: relative;
+        }
+
+        h1 {
+            font-size: 1.875rem;
+            /* text-3xl */
+            font-weight: 700;
+            /* font-bold */
+            text-align: center;
+            margin-bottom: 1.5rem;
+            /* mb-6 */
+            color: #818cf8;
+            /* Indigo 400 */
+        }
+
+        video {
+            width: 100%;
+            /* w-full */
+            height: 100%;
+            max-width: 90vw;
+            max-height: 90vh;
+            border-radius: 0.5rem;
+            /* rounded-lg */
+            border: 4px solid #6366f1;
+            /* border-4 border-indigo-500 */
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -2px rgba(0, 0, 0, 0.2);
+            margin-bottom: 1rem;
+            /* mb-4 */
+        }
+
+        #status {
+            text-align: center;
+            font-size: 0.875rem;
+            /* text-sm */
+            margin-top: 1rem;
+            /* mt-4 */
+            color: #94a3b8;
+            /* Gray 400 */
+        }
+
+        /* Style for play overlay */
+        #playOverlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(15, 23, 42, 0.98);
+            /* Semi-transparent dark blue (near-opaque) */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            cursor: pointer;
+            transition: opacity 0.3s ease-in-out;
+            text-align: center;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* Button Styles */
+        .join-button {
+            background-color: #4f46e5;
+            /* Indigo 600 */
+            color: white;
+            font-weight: 700;
+            /* font-bold */
+            padding: 1rem 2rem;
+            /* py-4 px-8 */
+            border-radius: 0.5rem;
+            /* rounded-lg */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5), 0 2px 4px -2px rgba(0, 0, 0, 0.5);
+            /* shadow-lg */
+            transition: all 0.15s ease-in-out;
+            /* transition duration-150 */
+            border: none;
+            cursor: pointer;
+        }
+
+        .join-button:hover {
+            background-color: #4338ca;
+            /* Indigo 700 */
+            transform: scale(1.05);
+            /* hover:scale-105 */
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- Video Player -->
+        <div>
+            <video id="syncedVideo" src="/video/stream" controls autoplay playsinline preload="auto">
+                Your browser does not support the video tag.
+            </video>
+        </div>
+
+        <div id="status">
+            Status: Initializing...
+        </div>
+    </div>
+
+    <!-- User Gesture Overlay -->
+    <div id="playOverlay">
+        <button class="join-button" id="joinButton">
+            Click to Join the Sync
+        </button>
+        <p style="font-size: 0.875rem; margin-top: 1rem; color: #94a3b8;">
+            Browser requires interaction to enable synchronized playback.
+        </p>
+    </div>
+
+    <script>
+        const video = document.getElementById('syncedVideo');
+        const statusElement = document.getElementById('status');
+        const playOverlay = document.getElementById('playOverlay');
+        const joinButton = document.getElementById('joinButton');
+
+        let isSyncing = false;
+        const SYNC_LAG_THRESHOLD = 0.5; // seconds difference allowed before seeking
+        const POLLING_INTERVAL = 1000; // milliseconds to wait between state checks
+
+        // Client -> Server Command Emitters (Fetch POST)
+        async function sendCommand(action) {
+            const data = { time: video.currentTime, action: action };
+
+            try {
+                // Send command using standard Fetch POST request
+                const response = await fetch('/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                if (!response.ok) {
+                    statusElement.textContent = `Status: Failed to send ${action} (${response.status} ${response.statusText})`;
+                    console.error('Command failed to reach server:', response.statusText);
+                } else {
+                    console.log(`Command sent: ${action}. Polling will apply state.`);
+                }
+            } catch (e) {
+                statusElement.textContent = 'Status: Network Error (Check Server)';
+                console.error('Network error sending command:', e);
+            }
+        }
+
+        // Server -> Client Synchronization Handlers (Polling Fetch GET)
+        function applySyncCommand(data, source) {
+            // Prevent local events from triggering the server again
+            isSyncing = true;
+
+            const serverTime = data.time;
+            const currentTime = video.currentTime;
+            const action = data.action;
+
+            // 1. Seek/Set Time
+            if (Math.abs(currentTime - serverTime) > SYNC_LAG_THRESHOLD) {
+                video.currentTime = serverTime;
+                console.log(`[${source}] Seeking to ${serverTime.toFixed(2)}s.`);
+            }
+
+            // 2. Apply Action (only check for play/pause, ignore 'seek' which is just a position update)
+            if (action === 'play' && video.paused) {
+                video.play().catch(e => console.error("Programmatic play failed after gesture:", e));
+                statusElement.textContent = 'Status: Playing (Synced via Polling)';
+            } else if (action === 'pause' && !video.paused) {
+                video.pause();
+                statusElement.textContent = 'Status: Paused (Synced via Polling)';
+            }
+
+            // Immediately release the sync flag after action
+            // Set longer timeout because polling might happen before 100ms is up.
+            setTimeout(() => { isSyncing = false; }, 200);
+        }
+
+        // Polling Function
+        async function pollState() {
+            try {
+                const response = await fetch('/state');
+                if (!response.ok) {
+                    throw new Error(`Server returned status ${response.status}`);
+                }
+                const data = await response.json();
+                applySyncCommand(data, "Poll");
+
+            } catch (e) {
+                console.error("Polling error:", e);
+                statusElement.textContent = 'Status: Polling Failed. Connection Issue.';
+            }
+
+            // Schedule the next poll
+            setTimeout(pollState, POLLING_INTERVAL);
+        }
+
+
+        // User Command Logic
+        window.enablePlayback = async () => {
+            isSyncing = true; // Block initial play/pause events from reaching server
+
+            try {
+                video.muted = true;
+                // CRITICAL: Must load metadata before seeking, especially on first load
+                if (video.readyState < 2) { // READY_STATE_HAVE_CURRENT_DATA
+                    await new Promise(resolve => video.addEventListener('loadeddata', resolve, { once: true }));
+                }
+
+                await video.play();
+                video.pause();
+                video.muted = false;
+
+                // Hide overlay and START POLLING instead of setting up SSE
+                playOverlay.classList.add('hidden');
+                pollState();
+
+            } catch (e) {
+                statusElement.textContent = 'Status: Playback Error (Try Reloading)';
+                console.error("Manual Playback Enable failed:", e);
+            } finally {
+                // Release sync block after a brief pause
+                setTimeout(() => { isSyncing = false; }, 200);
+            }
+        };
+
+        // --- Event Listener Setup (CSP Compliant) ---
+        joinButton.addEventListener('click', window.enablePlayback);
+
+        video.onplay = () => { if (isSyncing) return; sendCommand('play'); };
+        video.onpause = () => { if (isSyncing) return; sendCommand('pause'); };
+
+        let seekTimeout = null;
+        video.onseeking = () => {
+            if (isSyncing) return;
+            if (seekTimeout) clearTimeout(seekTimeout);
+
+            // Use a slight debounce to prevent spamming the server while seeking
+            seekTimeout = setTimeout(() => {
+                sendCommand('seek');
+            }, 250);
+        };
+
+    </script>
+</body>
+
+</html>
